@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
+from .muon import Muon
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -252,8 +253,20 @@ def get_mup_config_overrides(
 
 def _get_param_groups(
     model_chunks: List[MegatronModule],
+<<<<<<< HEAD
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+=======
+    no_weight_decay_cond: Optional[Callable],
+    scale_lr_cond: Optional[Callable],
+    lr_mult: float,
+    lr: float,
+    min_lr: float,
+    decoupled_lr: Optional[float],
+    decoupled_min_lr: Optional[float],
+    muon_matched_adamw_rms: Optional[float],
+    use_muon: bool = False,
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -278,6 +291,7 @@ def _get_param_groups(
 
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
+<<<<<<< HEAD
 
     if config_overrides is None:
         # TODO remove this default behavior eventually.
@@ -287,6 +301,9 @@ def _get_param_groups(
         #  to the new API.
         config_overrides = get_standard_config_overrides(config=config)
 
+=======
+    muon_params_map = {}
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
@@ -309,6 +326,7 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
+<<<<<<< HEAD
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
@@ -317,6 +335,52 @@ def _get_param_groups(
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
+=======
+            if no_weight_decay_cond is not None:
+                no_wd = no_weight_decay_cond(name, param)
+            else:
+                # Do not regularize biases and norm parameters.
+                no_wd = name.endswith(".bias") or len(param.shape) == 1
+
+            if scale_lr_cond is not None:
+                scale_lr = scale_lr_cond(name, param)
+            else:
+                scale_lr = False
+
+            if not no_wd and not scale_lr:
+                wd_mult, _lr_mult = 1.0, 1.0
+            elif not no_wd and scale_lr:
+                wd_mult, _lr_mult = 1.0, lr_mult
+            elif no_wd and not scale_lr:
+                wd_mult, _lr_mult = 0.0, 1.0
+            else:
+                wd_mult, _lr_mult = 0.0, lr_mult
+
+            is_decoupled_lr = False
+            # For input/embedding and output layer: embedding.word_embeddings.weight /
+            # output_layer.weight.
+            if use_decoupled_learning_rate and getattr(
+                param, 'is_embedding_or_output_parameter', False
+            ):
+                is_decoupled_lr = True
+
+            # check if linear params
+            bias_flag = name.endswith(".bias")
+            shape_flag = param.dim() == 2
+            embedding_flag = "embedding" in name or "output_layer" in name
+            muon_flag = use_muon and shape_flag \
+                and (not bias_flag) and (not embedding_flag)
+            if muon_flag:
+                key = (wd_mult, _lr_mult, is_expert_parallel)
+                if key not in muon_params_map:
+                    muon_params_map[key] = []
+                muon_params_map[key].append(param)
+            else:
+                key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+                if key not in params_map:
+                    params_map[key] = []
+                params_map[key].append(param)
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -371,6 +435,70 @@ def _get_param_groups(
         }
         param_groups.append(param_group)
 
+<<<<<<< HEAD
+=======
+    param_groups = _update_min_and_max_lr_in_param_groups(
+        param_groups,
+        lr=lr,
+        min_lr=min_lr,
+        decoupled_lr=decoupled_lr,
+        decoupled_min_lr=decoupled_min_lr,
+    )
+
+    for (wd_mult, _lr_mult, is_expert_parallel), params in muon_params_map.items():
+        if len(params) == 0:
+            continue
+        param_groups.append(
+            {
+                'params': params,
+                'wd_mult': wd_mult,
+                'lr_mult': _lr_mult,
+                'is_expert_parallel': is_expert_parallel,
+                'use_muon': True,
+                'is_decoupled_lr': False,
+            }
+        )
+
+    return param_groups
+
+
+def _update_min_and_max_lr_in_param_groups(
+    param_groups: List[Dict],
+    lr: float,
+    min_lr: float,
+    decoupled_lr: Optional[float],
+    decoupled_min_lr: Optional[float],
+) -> List[Dict]:
+    """
+    Updates `max_lr` and `min_lr` values in each parameter group, and returns new list.
+    By default, each group will use `lr` / `min_lr` as `max_lr` / `min_lr`.
+    If `decoupled_lr` is provided, then `decoupled_lr` / `decoupled_min_lr` will be used
+    as `max_lr` / `min_lr` for the input and output layer.
+
+    Args:
+        param_groups (List): parameter groups whose 'max_lr' and `min_lr` fields need to
+            be adjusted.
+        lr (float): learning rate.
+        min_lr (float): minimum learning rate.
+        decoupled_lr (Optional[float]): optional decoupled learning rate.
+        decoupled_min_lr (Optional[float]): optional decoupled minimum learning rate.
+
+    Returns:
+        List of adjusted parameter groups.
+    """
+
+    if decoupled_min_lr is None:
+        decoupled_min_lr = min_lr
+
+    for param_group in param_groups:
+        if param_group['is_decoupled_lr']:
+            assert decoupled_lr is not None
+            param_group['max_lr'] = decoupled_lr
+            param_group['min_lr'] = decoupled_min_lr
+        else:
+            param_group['max_lr'] = lr
+            param_group['min_lr'] = min_lr
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
     return param_groups
 
 
@@ -399,7 +527,22 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
+<<<<<<< HEAD
     param_groups = _get_param_groups(model_chunks, config, config_overrides)
+=======
+    param_groups = _get_param_groups(
+        model_chunks,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        lr=config.lr,
+        min_lr=config.min_lr,
+        decoupled_lr=config.decoupled_lr,
+        decoupled_min_lr=config.decoupled_min_lr,
+        muon_matched_adamw_rms=config.muon_matched_adamw_rms,
+        use_muon = config.optimizer == 'muon',
+    )
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -551,6 +694,25 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'muon':
+            optimizer = Muon(param_groups,
+                             lr=config.lr, weight_decay=config.weight_decay,
+                             matched_adamw_rms=config.muon_matched_adamw_rms,
+                             momentum=config.muon_momentum,
+                             nesterov=config.muon_nesterov,
+                             ns_steps=config.muon_ns_steps,
+                             adamw_betas=(config.adam_beta1, config.adam_beta2),
+                             adamw_eps=config.adam_eps)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config is None or not config.use_precision_aware_optimizer:
+                                opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            else:
+                                opt.initialize_state(p)
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:

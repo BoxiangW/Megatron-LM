@@ -2126,6 +2126,7 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+<<<<<<< HEAD
     group.add_argument('--muon-momentum', type=float, default=0.9,
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
@@ -2153,6 +2154,17 @@ def _add_regularization_args(parser):
                        '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
                        'qk layernorm as a special case.'
                        'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ')
+=======
+    group.add_argument('--muon-matched-adamw-rms', type=float, default=0.2,
+                       help="The RMS of the matched AdamW's, typically 0.2 ~ 0.4")
+    group.add_argument('--muon-momentum', type=float, default=0.95,
+                       help='Momentum beta for muon')
+    group.add_argument('--muon-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schultz iteartion steps for muon')
+    group.add_argument('--no-muon-nesterov', action='store_false',
+                       dest='muon_nesterov', default=True,
+                       help='If set, disable Nesterov momentum for muon')
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
     return parser
 
 
@@ -2340,7 +2352,11 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
+<<<<<<< HEAD
                        choices=['adam', 'sgd', 'muon', 'dist_muon'],
+=======
+                       choices=['adam', 'sgd', 'muon'],
+>>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
