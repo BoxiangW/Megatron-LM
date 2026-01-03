@@ -16,6 +16,8 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -38,10 +40,11 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f"Apex is not installed. Falling back to Torch Norm")
+    LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
@@ -52,7 +55,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
@@ -94,7 +97,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=TENorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=CrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,
@@ -142,8 +145,8 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             ),
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
-                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-                'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
             },
         ),
     )
@@ -189,8 +192,8 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             ),
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
-                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-                'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
             },
         ),
     )

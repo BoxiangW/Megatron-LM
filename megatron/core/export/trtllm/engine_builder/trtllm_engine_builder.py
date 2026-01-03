@@ -1,13 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import tensorrt_llm
-from tensorrt_llm._common import check_max_num_tokens
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.commands.build import build as build_trtllm
-from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig
-from tensorrt_llm.models.modeling_utils import optimize_model, preprocess_weights
-from tensorrt_llm.plugin import PluginConfig
+
+try:
+    import tensorrt_llm
+    from tensorrt_llm._common import check_max_num_tokens
+    from tensorrt_llm.builder import BuildConfig
+    from tensorrt_llm.commands.build import build as build_trtllm
+    from tensorrt_llm.logger import logger
+    from tensorrt_llm.lora_manager import LoraConfig
+    from tensorrt_llm.models.modeling_utils import optimize_model, preprocess_weights
+    from tensorrt_llm.plugin import PluginConfig
+
+    HAVE_TRTLLM = True
+except ImportError:
+    HAVE_TRTLLM = False
 
 
 class TRTLLMEngineBuilder:
@@ -38,6 +44,7 @@ class TRTLLMEngineBuilder:
         multiple_profiles: bool = False,
         gpt_attention_plugin: str = "auto",
         gemm_plugin: str = "auto",
+        reduce_fusion: bool = False,
     ):
         """Method to build the TRTLLM Engine
 
@@ -69,6 +76,12 @@ class TRTLLMEngineBuilder:
             gpt_attention_plugin (str, optional): Gpt attention plugin to use. Defaults to "auto".
             gemm_plugin (str, optional): Gemma plugin to use. Defaults to "auto".
         """
+
+        if not HAVE_TRTLLM:
+            raise ImportError(
+                "tensorrt_llm is not installed. Please install it with `pip install tensorrt-llm`"
+            )
+
         architecture = (
             "LLaMAForCausalLM"
             if trtllm_model_config.architecture == "LlamaForCausalLM"
@@ -90,6 +103,7 @@ class TRTLLMEngineBuilder:
         plugin_config.remove_input_padding = remove_input_padding
         plugin_config.use_paged_context_fmha = paged_context_fmha
         plugin_config.multiple_profiles = multiple_profiles
+        plugin_config.reduce_fusion = reduce_fusion
 
         if max_seq_len is None:
             max_seq_len = max_input_len + max_output_len
@@ -108,21 +122,27 @@ class TRTLLMEngineBuilder:
         )
 
         build_dict = {
-            'max_input_len': max_input_len,
-            'max_output_len': max_output_len,
-            'max_batch_size': max_batch_size,
-            'max_beam_width': max_beam_width,
-            'max_seq_len': max_seq_len,
-            'max_num_tokens': max_num_tokens,
-            'opt_num_tokens': opt_num_tokens,
-            'max_prompt_embedding_table_size': max_prompt_embedding_table_size,
-            'gather_context_logits': False,
-            'gather_generation_logits': False,
-            'strongly_typed': False,
-            'builder_opt': None,
-            'use_refit': use_refit,
-            'multiple_profiles': multiple_profiles,
+            "max_input_len": max_input_len,
+            "max_output_len": max_output_len,
+            "max_batch_size": max_batch_size,
+            "max_beam_width": max_beam_width,
+            "max_seq_len": max_seq_len,
+            "max_num_tokens": max_num_tokens,
+            "opt_num_tokens": opt_num_tokens,
+            "max_prompt_embedding_table_size": max_prompt_embedding_table_size,
+            "gather_context_logits": False,
+            "gather_generation_logits": False,
+            "strongly_typed": False,
+            "builder_opt": None,
+            "use_refit": use_refit,
+            "multiple_profiles": multiple_profiles,
         }
+
+        if trtllm_model_config.architecture == "DeciLMForCausalLM":
+            build_dict["strongly_typed"] = True
+            build_dict["use_fused_mlp"] = False
+            plugin_config.use_fused_mlp = False
+
         build_config = BuildConfig.from_dict(build_dict, plugin_config=plugin_config)
 
         if use_lora_plugin is not None:
@@ -130,19 +150,23 @@ class TRTLLMEngineBuilder:
             # build_config.plugin_config._lora_plugin = use_lora_plugin
             lora_config = LoraConfig(
                 lora_dir=lora_ckpt_list,
-                lora_ckpt_source='nemo',  # TODO : NEED TO SEE HOW TO HANDLE THIS FOR MCORE
+                lora_ckpt_source="nemo",  # TODO : NEED TO SEE HOW TO HANDLE THIS FOR MCORE
                 max_lora_rank=max_lora_rank,
                 lora_target_modules=lora_target_modules,
             )
             build_config.lora_config = lora_config
 
         model = model_cls.from_config(trtllm_model_config)
+
         model = optimize_model(
             model,
             use_parallel_embedding=trtllm_model_config.use_parallel_embedding,
             share_embedding_table=trtllm_model_config.share_embedding_table,
         )
+
         preprocess_weights(trtllm_model_weights, trtllm_model_config)
         model.load(trtllm_model_weights)
         engine = build_trtllm(model, build_config)
+
         engine.save(engine_dir)
+        return engine

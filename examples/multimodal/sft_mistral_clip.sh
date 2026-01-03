@@ -19,6 +19,10 @@ FINETUNE_DIR=${OUTPUT}/checkpoints
 LOGS_DIR="${OUTPUT}/logs"
 TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 
+export TRITON_CACHE_DIR="${WORKSPACE}/triton-cache/"
+# The following patch to the Triton cache manager is needed for Triton version <= 3.1
+export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
+
 if [[ -z $LOAD_NAME ]]; then
     echo "Please set LOAD_NAME for input model name."
     exit 1
@@ -26,11 +30,6 @@ fi
 
 if [[ -z $LOAD_ITER ]]; then
     echo "Please set LOAD_ITER for pre-trained input model iteration."
-    exit 1
-fi
-
-if [[ -z $TOKENIZER_MODEL ]]; then
-    echo "Please set TOKENIZER_MODEL for tokenizer model name."
     exit 1
 fi
 
@@ -97,8 +96,9 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 500 \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-type MultimodalTokenizer \
+    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
+    --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 500 \
@@ -125,6 +125,7 @@ OPTIONS=" \
     --disable-vision-class-token \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
+    --ckpt-format torch
 "
 
 export NVTE_APPLY_QK_LAYER_SCALING=0

@@ -1,5 +1,7 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 ##
-# Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
+# Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
 import random
@@ -26,7 +28,6 @@ def sample_N(dataset, N, randomize):
     return samples
 
 
-@pytest.mark.flaky
 def test_mock_gpt_dataset():
     if torch.distributed.is_available():
         Utils.initialize_distributed()
@@ -46,6 +47,7 @@ def test_mock_gpt_dataset():
         reset_attention_mask=True,
         eod_mask_loss=True,
         tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(
@@ -80,6 +82,7 @@ def test_mock_gpt_dataset():
         drop_last_partial_validation_sequence=False,
         add_extra_token_to_sequence=False,
         tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

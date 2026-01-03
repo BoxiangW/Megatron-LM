@@ -1,5 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import os
+
 import warnings
 from typing import Literal, Optional
 
@@ -8,17 +8,22 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.dot_product_attention import (
+    DotProductAttention as MCoreDotProductAttention,
+)
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import deprecate_inference_params
 from megatron.core.utils import get_te_version as _get_te_version
 from megatron.core.utils import is_te_min_version
 
@@ -49,6 +54,7 @@ class BertModel(LanguageModule):
             Options ['learned_absolute', 'rope']. Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -68,8 +74,10 @@ class BertModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         add_binary_head=True,
         return_embeddings=False,
+        vp_stage: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        super(BertModel, self).__init__(config=config)
+        super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -89,6 +97,7 @@ class BertModel(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.add_binary_head = add_binary_head
         self.return_embeddings = return_embeddings
+        self.vp_stage = vp_stage
 
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
@@ -120,6 +129,7 @@ class BertModel(LanguageModule):
             spec=self.transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            vp_stage=vp_stage,
         )
 
         # Output
@@ -175,16 +185,22 @@ class BertModel(LanguageModule):
         Returns:
             str: A string showing the format of the attn mask dimensions
         """
+        attention_backend = self.config.attention_backend
         attn_mask_dimensions = None
         # For local layer spec we just use b1ss
-        if self.transformer_layer_spec == bert_layer_local_spec:
+        if (
+            self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
+            == MCoreDotProductAttention
+        ):
+            assert attention_backend in [
+                AttnBackend.local,
+                AttnBackend.auto,
+            ], f'Expected AttnBackend to be local or auto while using mcore self attention, but found {attention_backend}. Set --attn-backend to local or dont use MCore SelfAttention submodule in layer specs'
             attn_mask_dimensions = "b1ss"
         else:
             attn_mask_type = self.transformer_layer_spec.submodules.self_attention.params[
                 'attn_mask_type'
             ]
-            flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
-            fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
             # For TE >= 1.10 (We always use padding mask and use b11s)
             if is_te_min_version("1.10.0"):
                 attn_mask_dimensions = "b11s"
@@ -197,7 +213,7 @@ class BertModel(LanguageModule):
                     ] = AttnMaskType.padding
             # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss
             elif is_te_min_version("1.7.0"):
-                if flash_attention_enabled or fused_attention_enabled:
+                if attention_backend in [AttnBackend.flash, AttnBackend.fused, AttnBackend.auto]:
                     attn_mask_dimensions = "b11s"
                 else:
                     if attn_mask_type != AttnMaskType.arbitrary:
@@ -211,10 +227,9 @@ class BertModel(LanguageModule):
             # For TE < 1.7 we only support unfused attention with b1ss and padding mask
             else:
                 attn_mask_dimensions = "b1ss"
-                assert not flash_attention_enabled and not fused_attention_enabled, (
+                assert not (attention_backend in [AttnBackend.flash, AttnBackend.fused]), (
                     "Flash and fused attention is not supported with transformer engine version "
-                    "< 1.7. Set NVTE_FLASH_ATTN=0 and NVTE_FUSED_ATTN=0 or upgrade transformer "
-                    "engine >= 1.7"
+                    "< 1.7. Set --attention-backend to unfused or leave it to be default (auto) or upgrade transformer engine >= 1.7"
                 )
 
         return attn_mask_dimensions
@@ -282,7 +297,9 @@ class BertModel(LanguageModule):
         attention_mask: Tensor,
         tokentype_ids: Tensor = None,
         lm_labels: Tensor = None,
-        inference_params=None,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Forward function of BERT model
 
@@ -292,6 +309,9 @@ class BertModel(LanguageModule):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 
         if parallel_state.is_pipeline_first_stage():
@@ -315,7 +335,7 @@ class BertModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config
+                inference_context, self.encoder, encoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -323,7 +343,7 @@ class BertModel(LanguageModule):
         hidden_states = self.encoder(
             hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
         )
         if not self.post_process:
@@ -331,6 +351,8 @@ class BertModel(LanguageModule):
 
         if self.add_binary_head:
             pooled_output = self.pooler(hidden_states, 0)
+        else:
+            pooled_output = None  # for pylint.
 
         if self.return_embeddings:
             embeddings = torch.transpose(hidden_states, 0, 1)

@@ -4,13 +4,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -20,6 +23,7 @@ if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
 
+@pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
@@ -65,9 +69,7 @@ class TestParallelGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False
-        )
+        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
         self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -75,7 +77,7 @@ class TestParallelGroupedMLP:
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear = False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp.config, self.sequential_mlp).module
         print("done intializing for sequential gemm")
 
         ## Grouped GEMM
@@ -85,7 +87,7 @@ class TestParallelGroupedMLP:
             self.num_experts, moe_grouped_gemm=True
         )
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
+        self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
         print("done intializing for grouped gemm")
 
     def teardown_method(self, method):
@@ -208,7 +210,11 @@ class TestParallelGroupedMLP:
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output_gmm, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
+        probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
+        probs = probs.cuda()
+        output_gmm, _ = self.grouped_mlp.experts(
+            hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
+        )
         output_gmm.mean().backward()
         assert self.grouped_mlp.experts.weight1.grad is not None
 
@@ -253,9 +259,7 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False
-        )
+        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
         self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -263,7 +267,7 @@ class TestTEGroupedMLP:
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear = False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp.config, self.sequential_mlp).module
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
@@ -273,7 +277,7 @@ class TestTEGroupedMLP:
         tf_config.moe_grouped_gemm = True
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
+        self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -364,7 +368,11 @@ class TestTEGroupedMLP:
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
+        probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
+        probs = probs.cuda()
+        output, _ = self.grouped_mlp.experts(
+            hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
+        )
         assert torch.equal(output, torch.zeros_like(output))
         assert output.shape == (num_allocated_tokens, self.hidden_size)
 

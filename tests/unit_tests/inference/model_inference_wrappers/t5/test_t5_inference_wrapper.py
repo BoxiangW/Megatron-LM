@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
@@ -18,6 +19,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -42,6 +44,7 @@ class TestT5InferenceWrapper:
             num_attention_heads=12,
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
+            attention_backend=AttnBackend.unfused,
         )
 
         encoder_config = deepcopy(transformer_config)
@@ -76,13 +79,17 @@ class TestT5InferenceWrapper:
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=hidden_size,
-            inference_batch_times_seqlen_threshold=20,
+            inference_batch_times_seqlen_threshold=-1,
             fp32_residual_connection=False,
             params_dtype=torch.float,
             padded_vocab_size=self.vocab_size,
         )
 
-        self.inference_wrapped_model = T5InferenceWrapper(t5_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        self.inference_wrapped_model = T5InferenceWrapper(
+            t5_model, inference_wrapper_config, inference_context
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -105,17 +112,23 @@ class TestT5InferenceWrapper:
             self.vocab_size, size=self.encoder_sequence_length
         ).tolist()
 
-        self.inference_wrapped_model.prep_model_for_inference(
+        self.inference_wrapped_model.prep_model_for_inference()
+
+        inference_input = self.inference_wrapped_model.prep_inference_input(
             prompts_tokens=batch_prompt_tokens,
             encoder_prompts=batch_encoder_prompts,
             tokenizer=mock_tokenizer,
         )
 
-        inference_input = self.inference_wrapped_model.get_batch_for_context_window(
-            0, self.decoder_sequence_length
+        inference_input_for_context_window = (
+            self.inference_wrapped_model.get_batch_for_context_window(
+                inference_input, 0, self.decoder_sequence_length
+            )
         )
 
-        logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
+        logits = self.inference_wrapped_model.run_one_forward_step(
+            inference_input_for_context_window
+        )
 
         assert logits.shape == (
             self.batch_size,

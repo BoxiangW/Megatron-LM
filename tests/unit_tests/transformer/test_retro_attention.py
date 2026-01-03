@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import types
 
 import pytest
@@ -76,12 +77,14 @@ class TestRetroAttention:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
+        os.environ['NVTE_FLASH_ATTN'] = "0"
+        os.environ['NVTE_FUSED_ATTN'] = "0"
+
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.flaky_in_dev
     def test_constructor(self):
 
         config = self.get_config()
@@ -193,6 +196,7 @@ class TestRetroAttention:
             config.hidden_size,
         )
 
+    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
         for recompute_granularity in (None, 'selective'):

@@ -21,6 +21,8 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -42,10 +44,11 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:

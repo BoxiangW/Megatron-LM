@@ -1,73 +1,29 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved. Except portions as noted which are Copyright (c) 2023 OpenGVLab and licensed under the MIT license found in LICENSE.
-import numpy as np
-import torch
-
-from PIL import Image, ImageDraw
 from torchvision import transforms as T
-from torchvision.transforms import Compose, RandAugment, RandomResizedCrop, Resize, ToPILImage
+from torchvision.transforms import Compose
+from torchvision.transforms.functional import InterpolationMode
 
 
-# Imagenet's mean and std.
-pixel_mean = [123.675, 116.28, 103.53]
-pixel_std = [58.395, 57.12, 57.375]
-
-# Reshape for broadcasting.
-pixel_mean = torch.Tensor(pixel_mean).view(-1, 1, 1)
-pixel_std = torch.Tensor(pixel_std).view(-1, 1, 1)
-
-
-def convert_to_rgb(image):
-    return image.convert("RGB")
-
-def _transform_train_aug(img_h, img_w):
-    return Compose([
-        ToPILImage(),
-        RandomResizedCrop((img_h, img_w), scale=(0.5, 1.0)),
-        convert_to_rgb,
-        RandAugment(2, 5, isPIL=True, augs=['Identity', 'AutoContrast', 'Brightness', 'Sharpness', 'Equalize',
-                                              'ShearX', 'ShearY', 'TranslateX', 'TranslateY', 'Rotate']),
-    ])
-
-def _transform_test(img_h, img_w):
-    return Compose([
-        ToPILImage(),
-        Resize((img_h, img_w)),
-        convert_to_rgb,
-    ])
+IMAGENET_PIXEL_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_PIXEL_STD = [0.229, 0.224, 0.225]
+SIGLIP_PIXEL_MEAN = [0.5, 0.5, 0.5]
+SIGLIP_PIXEL_STD = [0.5, 0.5, 0.5]
+CLIP_PIXEL_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CLIP_PIXEL_STD = [0.26862954, 0.26130258, 0.27577711]
+RADIO_G_PIXEL_MEAN = [0.4850, 0.4560, 0.4060]
+RADIO_G_PIXEL_STD = [0.2230, 0.2240, 0.2250]
 
 
-def standardize_image(img):
-    """Standardize image pixel values."""
-    return (torch.Tensor(np.array(img)).permute(2, 0, 1) - pixel_mean) / pixel_std
-
-
-def get_visual_transform(img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False):
-    if use_tiling:
-        assert img_h == img_w, "dynamic tiling expects equal tile height and width"
-        imgs = dynamic_preprocess(img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail)
-        imgs = [standardize_image(img.convert("RGB")) for img in imgs]
-    else:
-        img = np.array(img)
-        original_h, original_w = img.shape[0], img.shape[1]
-        ratio = float(max(img_h, img_w)) / max(original_h, original_w)
-        scaled_h, scaled_w = int(original_h * ratio + 0.5), int(original_w * ratio + 0.5)
-
-        if augment:
-            visual_transform = _transform_train_aug(scaled_h, scaled_w)
-        else:
-            visual_transform = _transform_test(scaled_h, scaled_w)
-
-        img = visual_transform(img)
-
-        # Standardize pixel values.
-        img = standardize_image(img)
-
-        # Pad to target image size.
-        delta_h, delta_w = img_h - scaled_h, img_w - scaled_w
-        img = torch.nn.functional.pad(img, (0, delta_w, 0, delta_h))
-        imgs = [img]
-
-    return imgs
+pixel_statistics = {
+    "clip": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "siglip": (SIGLIP_PIXEL_MEAN, SIGLIP_PIXEL_STD),
+    "internvit": (IMAGENET_PIXEL_MEAN, IMAGENET_PIXEL_STD),
+    "radio": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "radio-g": (RADIO_G_PIXEL_MEAN, RADIO_G_PIXEL_STD),
+    "cradio-g": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "internvit300M": (IMAGENET_PIXEL_MEAN, IMAGENET_PIXEL_STD),
+    "huggingface": (SIGLIP_PIXEL_MEAN, SIGLIP_PIXEL_STD),
+}
 
 
 # From https://github.com/OpenGVLab/InternVL/blob/c62fa4f7c850165d7386bdc48ac6bc5a6fab0864/internvl_chat/internvl/train/dataset.py#L685
@@ -85,13 +41,53 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
         elif ratio_diff == best_ratio_diff:
             if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
                 best_ratio = ratio
-    # print(f'width: {width}, height: {height}, best_ratio: {best_ratio}')
     return best_ratio
+
+
+def find_closest_area_weighted_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    """
+    Find the best number of tiles based on the aspect ratio and the area covered by the tiles.
+    """
+    best_factor = float('-inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        factor_based_on_area_n_ratio = (
+            min((ratio[0]*ratio[1]*image_size*image_size)/ area, 0.6) *
+            min(target_aspect_ratio/aspect_ratio, aspect_ratio/target_aspect_ratio))
+        if factor_based_on_area_n_ratio > best_factor:
+            best_factor = factor_based_on_area_n_ratio
+            best_ratio = ratio
+    return best_ratio
+
+
+class ImageTransform:
+    """Image transformation."""
+
+    def __init__(self, input_size, vision_model_type):
+        self._transform = _build_transform(input_size, vision_model_type)
+        self._vision_model_type = vision_model_type
+
+    def __call__(self, img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False, find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
+        assert not augment, "Image augmentation not implemented."
+        if use_tiling:
+            assert img_h == img_w, "dynamic tiling expects equal tile height and width"
+            imgs = dynamic_preprocess(
+                img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail,
+                find_closest_aspect_ratio_fn=find_closest_aspect_ratio_fn)
+            imgs = [self._transform(img) for img in imgs]
+        else:
+            imgs = [self._transform(img)]
+
+        return imgs
 
 
 # From https://github.com/OpenGVLab/InternVL/blob/c62fa4f7c850165d7386bdc48ac6bc5a6fab0864/internvl_chat/internvl/train/dataset.py#L702
 # Copyright (c) 2023 OpenGVLab.
-def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnail=False):
+def dynamic_preprocess(
+    image, min_num=1, max_num=6, image_size=448, use_thumbnail=False,
+    find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
 
@@ -102,7 +98,7 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
     target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
 
     # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(
+    target_aspect_ratio = find_closest_aspect_ratio_fn(
         aspect_ratio, target_ratios, orig_width, orig_height, image_size)
 
     # calculate the target width and height
@@ -128,3 +124,45 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
         thumbnail_img = image.resize((image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images
+
+
+# Based on https://github.com/openai/CLIP/blob/dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1/clip/clip.py#L79
+# and https://github.com/OpenGVLab/InternVL/blob/aa521e6eb1df4cf153aa4118fcf13e673c055d46/internvl_chat/internvl/train/dataset.py#L276
+def _build_transform(input_size, vision_model_type):
+    if vision_model_type in ("siglip", "internvit", "internvit300M", "radio", "radio-g", "cradio-g"):
+        pixel_mean, pixel_std = pixel_statistics[vision_model_type]
+
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=pixel_mean, std=pixel_std)
+        ])
+    elif vision_model_type == "clip":
+        pixel_mean, pixel_std = pixel_statistics[vision_model_type]
+
+        transform = Compose([
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.ToTensor(),
+            T.Normalize(mean=pixel_mean, std=pixel_std),
+        ])
+    elif vision_model_type.startswith("hf://"):
+        from megatron.core.models.huggingface.module import get_hf_model_type
+
+        model_type = get_hf_model_type(vision_model_type)
+        if "siglip" in model_type:
+            from transformers.models.siglip.image_processing_siglip import SiglipImageProcessor
+
+            processor = SiglipImageProcessor(size={"height": input_size, "width": input_size})
+
+            def transform(x):
+                x = x.convert("RGB") if x.mode != "RGB" else x
+                x = processor(x, return_tensors="pt")
+                return x["pixel_values"][0]
+        else:
+            raise NotImplementedError(f"image processing not defined for huggingface model {vision_model_type}")
+    else:
+        raise NotImplementedError(f"image processing not defined for vision model {vision_model_type}")
+
+    return transform

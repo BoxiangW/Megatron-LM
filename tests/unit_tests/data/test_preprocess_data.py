@@ -183,7 +183,6 @@ def gpt2_merge(odir):
     return path
 
 
-@pytest.mark.flaky
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -192,9 +191,9 @@ def test_preprocess_data_gpt():
             "--tokenizer-type",
             "GPT2BPETokenizer",
             "--vocab-file",
-            gpt2_vocab(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
             "--merge-file",
-            gpt2_merge(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-merges.txt",
             "--append-eod",
             "--workers",
             "10",
@@ -215,6 +214,7 @@ def bert_vocab(odir):
 
 
 @pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -223,7 +223,7 @@ def test_preprocess_data_bert():
             "--tokenizer-type",
             "BertWordPieceLowerCase",
             "--vocab-file",
-            bert_vocab(temp_dir),
+            "/opt/data/tokenizers/megatron/gpt2-vocab.json",
             "--split-sentences",
             "--workers",
             "10",

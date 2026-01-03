@@ -2,14 +2,30 @@
 
 import io
 import logging
+import os
 
 import numpy as np
 import pytest
 import torch
 from torch.distributed.checkpoint import CheckpointException as PyTCheckpointingException
+from torch.distributed.checkpoint import FileSystemReader
+
+try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing import (
+    ShardedTensor,
+    load,
+    load_content_metadata,
+    remove_sharded_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
@@ -18,7 +34,9 @@ from megatron.core.dist_checkpointing.serialization import (
     load_tensors_metadata,
 )
 from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -42,6 +60,16 @@ class TestSerialization:
             ),
         }
 
+        if HAVE_DTENSOR:
+            mesh = DeviceMesh.from_group(
+                parallel_state.get_data_parallel_group(with_context_parallel=True), "cuda"
+            )
+            sharded_state_dict['sd_keyD'] = ShardedTensor.from_rank_offsets(
+                'keyD',
+                DTensor.from_local(torch.ones(3, 5, 7), mesh)._local_tensor,
+                replica_id=Utils.rank,
+            )
+
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_single_process_save_load', sync=True
@@ -55,6 +83,9 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+                if HAVE_DTENSOR:
+                    assert (ckpt_dir / 'keyD').is_dir()
 
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
@@ -79,11 +110,22 @@ class TestSerialization:
             'sd_keyB': ShardedTensor.from_rank_offsets(
                 'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
             ),
+            'lr': 0.01,
+            'rank': torch.distributed.get_rank(),
         }
+
+        def preprocess_fn(x):
+            del x['rank']
+            return x
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         with TempNamedDir(tmp_path_dist_ckpt / 'test_multi_process_save', sync=True) as ckpt_dir:
-            save(state_dict, ckpt_dir)
+            save(
+                state_dict,
+                ckpt_dir,
+                validate_access_integrity=True,
+                preprocess_common_before_consistancy_check=preprocess_fn,
+            )
 
             saved_config = maybe_load_config(ckpt_dir)
             if saved_config.sharded_backend == 'zarr':
@@ -91,6 +133,64 @@ class TestSerialization:
                 assert (ckpt_dir / 'keyB').is_dir()
                 assert not (ckpt_dir / 'keyC').exists()
                 assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+        Utils.destroy_model_parallel()
+
+    def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
+        Utils.initialize_model_parallel(2, 4)
+        rank = Utils.rank
+        world_size = Utils.world_size
+
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, rank, world_size)
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', torch.ones(3, 5, 7), (2, rank, world_size)
+            ),
+            'rank': rank,
+        }
+
+        def preprocess_fn(x):
+            return x
+
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_multi_process_save_log_difference', sync=True
+        ) as ckpt_dir:
+            with caplog.at_level(logging.WARNING):
+                save(
+                    state_dict,
+                    ckpt_dir,
+                    validate_access_integrity=True,
+                    preprocess_common_before_consistancy_check=preprocess_fn,
+                )
+
+        if rank == 0:
+            # Rank 0 should not log the warning related to common state dict difference
+            assert not any(
+                f"Rank {rank} common state dict differs from rank 0 common state dict."
+                in record.message
+                for record in caplog.records
+            )
+        else:
+            found_detailed_match = False
+            # Construct the expected full message string based on user request
+            expected_full_message = (
+                f"Rank {rank} common state dict differs from rank 0 common state dict. "
+                f"Keys only on rank 0: [], "
+                f"Keys only on {rank}: [], "
+                f"Mismatched keys: [(('rank',), <class 'int'>, <class 'int'>)]"
+            )
+
+            for record in caplog.records:
+                if record.message == expected_full_message:
+                    found_detailed_match = True
+                    break
+
+            assert (
+                found_detailed_match
+            ), f"Did not find expected log message format for mismatch on rank {rank}. Expected: {expected_full_message}"
 
         Utils.destroy_model_parallel()
 
@@ -443,6 +543,289 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.3.0"),
+        reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
+    )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 4)
+
+        # Global tensor is just a range(32) repeated twice over the first dimension
+        global_tensor = torch.arange(4).unsqueeze(0).expand(2, 4)
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_prefix_key_to_remove': ShardedTensor.from_rank_offsets(
+                'prefix_key_to_remove', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
+            ),
+        }
+
+        prefix_name = "prefix"  ## we will drop all tensors whose keys begin with "prefix"
+
+        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_remove_sharded_tensor_prefix', sync=True
+        ) as ckpt_dir:
+            save_strategy = TorchDistSaveShardedStrategy(
+                "torch_dist", 1, separation_hint=prefix_name
+            )
+            save(state_dict, ckpt_dir, save_strategy)
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == torch.distributed.get_world_size()
+
+            fs_reader = FileSystemReader(ckpt_dir)
+            original_metadata = fs_reader.read_metadata()
+            assert set(original_metadata.state_dict_metadata.keys()) == {
+                'keyA',
+                'prefix_key_to_remove',
+            }
+
+            if torch.distributed.get_rank() == 0:
+                remove_sharded_tensors(ckpt_dir, key_prefix=prefix_name)
+            torch.distributed.barrier()
+
+            files = os.listdir(ckpt_dir)
+            prefix_files = [f for f in files if f.startswith(prefix_name)]
+            assert len(prefix_files) == 0
+
+            new_metadata = fs_reader.read_metadata()
+            assert set(new_metadata.state_dict_metadata.keys()) == {'keyA'}
+
+        Utils.destroy_model_parallel()
+
+    def test_empty_load(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2, 4)
+
+        if Utils.rank == 0:
+            state_dict = {'common': 'common-value'}
+        elif Utils.rank == 1:
+            state_dict = {'a': 3}  # this is not saved at all (common saved by rank 0 only)
+        elif Utils.rank == 2:
+            state_dict = {'b': 3}  # this is not saved at all (common saved by rank 0 only)
+        else:
+            state_dict = {
+                'a': ShardedTensor.from_rank_offsets(
+                    'x', torch.ones((2,)) * Utils.rank, replica_id=Utils.rank - 3
+                )
+            }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_empty_load', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            assert loaded_state_dict['common'] == 'common-value'
+
+            if Utils.rank <= 2:
+                assert loaded_state_dict.keys() == {'common'}
+            else:
+                assert loaded_state_dict.keys() == {'common', 'a'}
+                loaded_state_dict['a'].cpu().numpy().tolist() == [
+                    3,
+                    3,
+                ]  # rank 3 held the main replica so did the saving
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_checkpoint(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_checkpoint', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_metadata = load_content_metadata(ckpt_dir)
+
+        assert loaded_metadata == content_metadata
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_state_dict(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_state_dict', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            loaded_metadata = load_content_metadata(preloaded_state_dict=loaded_state_dict)
+
+        assert loaded_metadata == content_metadata
+
+    @pytest.mark.parametrize(
+        ('src_split', 'dest_split'),
+        [
+            # Same src and dest
+            ([3] * 8, None),
+            (list(range(1, 9)), None),
+            ([1, 5, 7, 3, 6, 2, 5, 4], None),
+            ([2, 2, 2, 2, 2, 2, 2, 1], None),
+            ([2, 2, 2, 2, 2, 2, 2, 10], None),
+            # Different src and dest
+            ([3] * 8, [1] * 6 + [2, 16]),
+            ([1, 5, 7, 3, 6, 2, 5, 4], [14, 3, 6, 3, 1, 1, 2, 3]),
+            # Empty shards
+            ([5] * 6 + [0, 0], [5, 0, 5, 0, 5, 5, 3, 7]),
+            ([15] + [0] * 7, [0, 0, 0] + [3] * 5),
+        ],
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
+    )
+    def test_uneven_1d_sharding(self, tmp_path_dist_ckpt, src_split, dest_split):
+        Utils.initialize_model_parallel(2, 4)
+
+        if dest_split is None:
+            dest_split = src_split
+
+        assert len(src_split) == Utils.world_size
+        assert len(dest_split) == len(src_split)
+        assert sum(src_split) == sum(dest_split)
+
+        def _create_1d_sharded_tensor_based_on_split(split, content_split=None, key='a'):
+            # Split [a, b, c] means a global tensor of shape (a + b + c,), divided
+            # into 3 rank, with a, b, c, elements on each rank
+            global_shape = (sum(split),)  # Sum of all splits
+            local_shape = (split[Utils.rank],)  # Split size of this rank
+            global_offset = (sum(split[: Utils.rank]),)  # Sum of all sizes before this rank
+
+            if content_split is None:
+                data = torch.zeros(local_shape)
+            else:
+                data = torch.zeros(global_shape)
+                assert len(content_split) == len(split)
+                # Content split determines the data stored in the global tensor.
+                # Content split [a, b, c] means `a` zeros, `b` ones and `c` twos.
+                content_split = torch.cumsum(torch.tensor(content_split), 0)
+                for (
+                    idx
+                ) in content_split:  # this handles `data[content_split] += 1` with repeating values
+                    if idx < len(data):
+                        data[idx] += 1
+                    else:
+                        assert idx == len(data)
+                data = data.cumsum(0)
+                data = data[global_offset[0] : global_offset[0] + local_shape[0]]
+                assert data.shape == local_shape
+            return ShardedTensor(
+                key, data, data.dtype, data.shape, global_shape, global_offset, None
+            )
+
+        state_dict = {'a': _create_1d_sharded_tensor_based_on_split(src_split, dest_split)}
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_uneven_sharding', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+
+            state_dict = {'a': _create_1d_sharded_tensor_based_on_split(dest_split)}
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            assert torch.all(loaded_state_dict['a'] == Utils.rank)
+
+    @pytest.mark.parametrize(
+        ('src_split', 'dest_split'),
+        [
+            # Same src and dest
+            ([[3]] * 8, None),
+            ([[]] * 7 + [[3, 3]], None),
+            ([[4], [7, 8], [1], [1], [1], [1], [1], [3, 3]], None),
+            ([[2]] * 5 + [[10]] * 3, [[10]] * 3 + [[2]] * 5),
+            (
+                [[4], [7, 8], [1], [1], [1], [1], [1], [3, 3]],
+                [[2, 4], [], [5], [], [5, 9], [], [1, 1, 1, 1, 1], []],
+            ),
+            ([[3]] * 8, [[2, 4]] * 4 + [[]] * 4),
+        ],
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
+    )
+    def test_uneven_1d_sharding_multiple_shards(self, tmp_path_dist_ckpt, src_split, dest_split):
+        """The same as test_uneven_1d_sharding but with multiple shards per rank.
+
+        src_split and dest_split have now 2 levels.
+        """
+        Utils.initialize_model_parallel(2, 4)
+
+        if dest_split is None:
+            dest_split = src_split
+
+        def nested_sum(x):
+            return sum(map(sum, x))
+
+        assert len(src_split) == Utils.world_size
+        assert len(dest_split) == len(src_split)
+        assert nested_sum(src_split) == nested_sum(dest_split)
+
+        def _create_1d_sharded_tensors_based_on_split(split, content_split=None, key='a'):
+            # Split [a, b, c] means a global tensor of shape (a + b + c,), divided
+            # into 3 rank, with a, b, c, elements on each rank
+            global_shape = (nested_sum(split),)  # Sum of all splits
+            global_offset_base = nested_sum(
+                split[: Utils.rank]
+            )  # Sum of all sizes before this rank
+
+            local_shards = []
+            for local_split in split[Utils.rank]:
+                local_shape = (local_split,)
+                global_offset = (global_offset_base,)
+                global_offset_base += local_split
+
+                if content_split is None:
+                    data = torch.zeros(local_shape)
+                else:
+                    data = torch.zeros(global_shape)
+                    assert len(content_split) == len(split)
+                    # Content split determines the data stored in the global tensor.
+                    # Content split [a, b, c] means `a` zeros, `b` ones and `c` twos.
+                    cumsum_content_split = torch.cumsum(
+                        torch.tensor(list(map(sum, content_split))), 0
+                    )
+                    for (
+                        idx
+                    ) in (
+                        cumsum_content_split
+                    ):  # this handles `data[cumsum_content_split] += 1` with repeating values
+                        if idx < len(data):
+                            data[idx] += 1
+                        else:
+                            assert idx == len(data)
+                    data = data.cumsum(0)
+                    data = data[global_offset[0] : global_offset[0] + local_shape[0]]
+                    assert data.shape == local_shape
+                local_shards.append(
+                    ShardedTensor(
+                        key, data, data.dtype, data.shape, global_shape, global_offset, None
+                    )
+                )
+            return local_shards
+
+        state_dict = dict(
+            enumerate(_create_1d_sharded_tensors_based_on_split(src_split, dest_split))
+        )
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_uneven_sharding', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+
+            state_dict = dict(enumerate(_create_1d_sharded_tensors_based_on_split(dest_split)))
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            for local_shard in loaded_state_dict.values():
+                assert torch.all(local_shard == Utils.rank)
+
 
 class TestNonStrictLoad:
     def setup_method(self, method):
@@ -466,7 +849,7 @@ class TestNonStrictLoad:
             ),
         }
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
@@ -540,7 +923,7 @@ class TestNonStrictLoad:
             loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
             assert 'TenA' in loaded_state_dict
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_missing_keys_raises_error_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
@@ -578,10 +961,7 @@ class TestNonStrictLoad:
 
             with caplog.at_level(logging.WARNING):
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
-            assert (
-                caplog.text == ''
-                or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-            )
+            assert caplog.text == ''
             assert 'TenB' in loaded_state_dict
 
             loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(
@@ -613,7 +993,7 @@ class TestNonStrictLoad:
             assert unexpected_keys == set()
             assert missing_keys == {'TenA', 'ObjB'}
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
         sharded_state_dict = self._get_base_state_dict()
@@ -640,26 +1020,20 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict = load_with_flag(strict)
-                assert (
-                    caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-                )
+                assert caplog.text == ''
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
 
             for strict in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
-                assert (
-                    caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-                )
+                assert caplog.text == ''
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()
                 assert unexpected_keys == set()
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
 
         sharded_state_dict = self._get_base_state_dict()

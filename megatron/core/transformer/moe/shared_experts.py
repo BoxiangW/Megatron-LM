@@ -17,14 +17,14 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-)
-from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_sharded_tensor_for_checkpoint
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    make_sharded_tensor_for_checkpoint,
+)
 
 
 class SharedExpertMLP(MLP):
@@ -36,27 +36,58 @@ class SharedExpertMLP(MLP):
     # The shared experts are scheduled into this stream to be overlapped with the dispatcher.
     stream = None
 
-    def __init__(self, config: TransformerConfig, spec: ModuleSpec):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        gate: bool,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
-        super().__init__(config=config, submodules=spec.submodules)
+        # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
 
-        self.use_shared_expert_gate = spec.params.get("gate", False)
+        self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
+            # TODO: Add support for GPU initialization, which requires updating the golden values.
             self.gate_weight = torch.nn.Parameter(torch.empty((1, self.config.hidden_size)))
             if config.perform_initialization:
-                if get_cuda_rng_tracker().is_initialized():
-                    with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-                        config.init_method(self.gate_weight)
-            else:
                 config.init_method(self.gate_weight)
             self.gate_weight.data = self.gate_weight.data.to(dtype=config.params_dtype)
             setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
         else:
             self.gate_weight = None
+
+        if (
+            self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
+            # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
+            # the shared expert linear_fc1 also saves the quantized tensor of this output.
+            # Here we set the linear_fc1 to save the original input tensors to avoid the extra
+            # memory usage of the quantized tensor.
+            shared_experts_recompute = (
+                config.recompute_granularity == 'selective'
+                and "shared_experts" in config.recompute_modules
+            )
+            if not shared_experts_recompute:
+                try:
+                    HAVE_TE = True
+                    from megatron.core.extensions.transformer_engine import (
+                        TELinear,
+                        set_save_original_input,
+                    )
+                except ImportError:
+                    HAVE_TE = False
+                    TELinear, set_save_original_input = None, None
+
+                if HAVE_TE and isinstance(self.linear_fc1, TELinear):
+                    set_save_original_input(self.linear_fc1)
 
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module
@@ -64,6 +95,10 @@ class SharedExpertMLP(MLP):
                 if hasattr(linear, 'parallel_mode'):
                     # TELinear
                     linear.parallel_mode = None
+                    linear.ub_overlap_rs_fprop = False
+                    linear.ub_overlap_ag_dgrad = False
+                    linear.ub_overlap_ag_fprop = False
+                    linear.ub_overlap_rs_dgrad = False
                 else:
                     # MCore legacy Linear
                     linear.explicit_expert_comm = True
@@ -106,7 +141,11 @@ class SharedExpertMLP(MLP):
             state_dict = self.state_dict(prefix='', keep_vars=True)
             sub_sd = {
                 f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
-                    state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets
+                    state_dict[name],
+                    f'{prefix}{name}',
+                    prepend_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
             }
             sharded_state_dict.update(sub_sd)
@@ -148,7 +187,11 @@ class SharedExpertMLP(MLP):
             intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None
 
-            if self.config.bias_activation_fusion:
+            if self.config.use_te_activation_func:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+            elif self.config.bias_activation_fusion:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
                         intermediate_parallel = bias_geglu_impl(
@@ -235,28 +278,17 @@ class SharedExpertMLP(MLP):
         return output
 
 
-TORCH_MAJOR = int(torch.__version__.split(".")[0])
-TORCH_MINOR = int(torch.__version__.split(".")[1])
-TORCH_LAST = torch.__version__.split(".")[2]
-
-
 def set_tensor_grad_fn_sequence_sr(tensor, value):
     """
     Set sequence_sr for the grad_fn of a tensor to control the backward order.
     For older PyTorch version, do nothing (backward order is not changed).
     The bigger the value is, the earlier the grad_fn is scheduled.
     """
-    if (
-        (TORCH_MAJOR > 2)
-        or (TORCH_MAJOR == 2 and TORCH_MINOR > 2)
-        or (TORCH_MAJOR == 2 and TORCH_MINOR == 2 and '+' not in TORCH_LAST)
-    ):
-        # In NVIDIA PyTorch container 24.01, the PyTorch version is 2.2.0a0+81ea7a4,
-        # which does not contian the set_sequence_nr commit.
+    if is_torch_min_version("2.2.0"):
         if tensor is not None and tensor.grad_fn is not None:
             tensor.grad_fn._set_sequence_nr(value)
     else:
         warnings.warn(
             "WARNING : PyTorch is too old to set sequence_sr and the performance may not "
-            "optimal. Please use PyTorch >= 2.2.0 for better performance."
+            "be optimal. Please use PyTorch >= 2.2.0 for better performance."
         )
