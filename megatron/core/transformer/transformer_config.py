@@ -258,6 +258,28 @@ class TransformerConfig(ModelParallelConfig):
     training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
+    mup_initialization: bool = False
+    """
+    If True, uses the MuP initialization method for the model. For more details, please refer to the
+    MuP paper: https://arxiv.org/abs/2203.03466 and https://www.spaces.ac.cn/archives/10770. 
+    For SGD, Adam and Muon, initialization methods and learning rate multipliers are different. 
+    This handle will set the initialization method and learning rate multipliers for the embedding 
+    layer and linear layers accordingly. Assume model depth is not changed.
+
+    | Optimizer | Emb init var & lr mult | Linear init var & lr mult | Output init var & lr mult |
+    |-----------|------------------------|---------------------------|---------------------------|
+    | SGD       | 1/d_in & d             | 1/d & 1                   | 1/(d^2) & 1/d             |
+    | Adam      | 1/d_in & 1             | 1/d & 1/d                 | 1/(d^2) & 1/d             |
+    | Muon      | 1/d_in & 1 (Adam)      | 1/d & 1                   | 1/(d^2) & 1/d (Adam)      |
+    """
+
+    mup_multiplier: float = 1.0
+    """
+    Multiplier for the MuP initialization. Defaults to 1.0. Represent the ratio of current hidden 
+    size to the original hidden size. For example, if the current hidden size is 4096 and the
+    original hidden size is 1024, then the multiplier is 4.0.
+    """
+
     ####################
     # mixed-precision
     ####################
@@ -1376,14 +1398,24 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            self.init_method = init_method_normal(self.init_method_std)
+            if self.mup_initialization:
+                self.init_method = init_method_normal(self.init_method_std / self.mup_multiplier)
+            else:
+                self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std,
-                self.num_layers,
-                multiplier=2.0 if not self.is_hybrid_model else 1.0,
-            )
+            if self.mup_initialization:
+                self.output_layer_init_method = scaled_init_method_normal(
+                    self.init_method_std / self.mup_multiplier ** 2,
+                    self.num_layers,
+                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+                )
+            else:   
+                self.output_layer_init_method = scaled_init_method_normal(
+                    self.init_method_std,
+                    self.num_layers,
+                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+                )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (
