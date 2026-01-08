@@ -715,10 +715,7 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, 
-        scale_lr_cond=(lambda name, param: args.scale_lr_layer in name) if args.scale_lr_layer else None,
-        lr_mult=args.lr_multiplier,
-        checkpointing_context=checkpointing_context,
+        model_provider, model_type, checkpointing_context=checkpointing_context,
     )
 
     timers('model-and-optimizer-setup').stop()

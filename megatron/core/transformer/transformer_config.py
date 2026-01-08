@@ -280,6 +280,12 @@ class TransformerConfig(ModelParallelConfig):
     original hidden size is 1024, then the multiplier is 4.0.
     """
 
+    mup_change_init_method_std: bool = False
+    """
+    If True, use init_method_std as the standard std for the smaller model. Apply the multiplier to
+    it for the larger model.
+    """
+
     ####################
     # mixed-precision
     ####################
@@ -1398,13 +1404,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            if self.mup_initialization:
+            if self.mup_initialization and self.mup_change_init_method_std:
                 self.init_method = init_method_normal(self.init_method_std / self.mup_multiplier)
             else:
                 self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            if self.mup_initialization:
+            if self.mup_initialization and self.mup_change_init_method_std:
                 self.output_layer_init_method = scaled_init_method_normal(
                     self.init_method_std / self.mup_multiplier ** 2,
                     self.num_layers,
