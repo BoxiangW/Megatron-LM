@@ -1171,6 +1171,45 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
 
+    if args.use_mup:
+        if args.optimizer == 'adam':
+            mup_linear_lr_config: ParamGroupOverride = {
+                "max_lr": args.lr / args.mup_multiplier,
+                "min_lr": args.min_lr / args.mup_multiplier,
+            }
+            mup_output_lr_config: ParamGroupOverride = {
+                "max_lr": args.lr / args.mup_multiplier,
+                "min_lr": args.min_lr / args.mup_multiplier,
+            }
+            
+            mup_linear_param_key = ParamKey(name="linear.weight")
+            mup_output_param_key = ParamKey(name="output_layer.weight")
+
+            config_overrides[mup_linear_param_key] = mup_linear_lr_config
+            config_overrides[mup_output_param_key] = mup_output_lr_config
+        elif args.optimizer == 'sgd':
+            mup_embedding_lr_config: ParamGroupOverride = {
+                "max_lr": args.lr * args.mup_multiplier,
+                "min_lr": args.min_lr * args.mup_multiplier,
+            }
+            mup_output_lr_config: ParamGroupOverride = {
+                "max_lr": args.lr / args.mup_multiplier,
+                "min_lr": args.min_lr / args.mup_multiplier,
+            }
+
+            mup_embedding_param_key = ParamKey(name="embedding.word_embeddings.weight")
+            mup_output_param_key = ParamKey(name="output_layer.weight")
+
+            config_overrides[mup_embedding_param_key] = mup_embedding_lr_config
+            config_overrides[mup_output_param_key] = mup_output_lr_config
+        elif 'muon' in args.optimizer:
+            #TODO(boxiang): Implement muP for Muon optimizer.
+            # mup_output_lr_config: ParamGroupOverride = {
+            #     "max_lr": args.lr / args.mup_multiplier,
+            #     "min_lr": args.min_lr / args.mup_multiplier,
+            # }
+            raise ValueError("Invalid optimizer type!")
+
     return config, config_overrides
 
 

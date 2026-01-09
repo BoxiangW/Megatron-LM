@@ -258,7 +258,7 @@ class TransformerConfig(ModelParallelConfig):
     training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
-    mup_initialization: bool = False
+    use_mup: bool = False
     """
     If True, uses the MuP initialization method for the model. For more details, please refer to the
     MuP paper: https://arxiv.org/abs/2203.03466 and https://www.spaces.ac.cn/archives/10770. 
