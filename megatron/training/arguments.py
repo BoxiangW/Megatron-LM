@@ -1012,6 +1012,8 @@ def validate_args(args, defaults={}):
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
+        assert not args.use_mup, \
+            '--use-mup is not supported when using decoupled learning rate.'
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -2460,6 +2462,15 @@ def _add_learning_rate_args(parser):
                        'Or,   --scale-lr-layer "head"        to scale lr for lm-head (during pretraining or finetuning).')
     group.add_argument('--lr-multiplier', type=float, default=1.0,
                        help='Learning rate multiplier for the specified layer in scale-lr-layer.')
+    group.add_argument('--use-mup', action='store_true',
+                       help='Use Maximal Update Parametrization.')
+    group.add_argument('--mup-change-init-method-std', action='store_true',
+                       help='If True, use init_method_std as the standard std for the smaller model.'
+                       'Apply the multiplier to it for the larger model.')
+    group.add_argument('--mup-multiplier', type=float, default=1.0,
+                       help='MuP multiplier. Defaults to 1.0. Represent the ratio of current hidden'
+                       'size to the original hidden size. For example, if the current hidden size is'
+                       '4096 and the original hidden size is 1024, then the multiplier is 4.0.')
 
     return parser
 
