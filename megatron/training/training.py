@@ -1182,6 +1182,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
         config_overrides = None
 
     if args.use_mup:
+        config_overrides = {}
         if args.optimizer == 'adam':
             mup_linear_lr_config: ParamGroupOverride = {
                 "max_lr": args.lr / args.mup_multiplier,

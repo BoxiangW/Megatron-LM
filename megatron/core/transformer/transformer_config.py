@@ -1404,15 +1404,17 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            if self.mup_initialization and self.mup_change_init_method_std:
-                self.init_method = init_method_normal(self.init_method_std / self.mup_multiplier)
+            if self.use_mup and self.mup_change_init_method_std:
+                self.init_method = init_method_normal(
+                    self.init_method_std / self.mup_multiplier ** 0.5
+                )
             else:
                 self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            if self.mup_initialization and self.mup_change_init_method_std:
+            if self.use_mup and self.mup_change_init_method_std:
                 self.output_layer_init_method = scaled_init_method_normal(
-                    self.init_method_std / self.mup_multiplier ** 2,
+                    self.init_method_std / self.mup_multiplier,
                     self.num_layers,
                     multiplier=2.0 if not self.is_hybrid_model else 1.0,
                 )
