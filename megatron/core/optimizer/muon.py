@@ -133,6 +133,80 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # emerging-optimizers use None instead of -1 to indicate no tensor parallel
             partition_dim = None
 
+        # Handle Megatron FSDP ZeRO-2/3: grad is a DTensor with Shard(0) placement on the DP
+        # mesh dimension. Strategy: all-gather local shards across the DP group to reconstruct
+        # the full TP-local gradient, apply Newton-Schulz, then re-shard back.
+        try:
+            from torch.distributed.tensor import DTensor
+            from torch.distributed.tensor.placement_types import Shard as DTensorShard
+
+            _have_dtensor = True
+        except ImportError:
+            _have_dtensor = False
+
+        if _have_dtensor and isinstance(grad, DTensor):
+            # Find mesh dims with Shard(0) placement (DP sharding dimensions).
+            dp_shard_dims = [
+                i
+                for i, pl in enumerate(grad.placements)
+                if isinstance(pl, DTensorShard) and pl.dim == 0
+            ]
+            if len(dp_shard_dims) > 1:
+                raise NotImplementedError(
+                    "Muon with FSDP full HSDP outer sharding (multiple Shard(0) dims) is not yet "
+                    "supported. Use outer_dp_sharding_strategy='no_shard' (default)."
+                )
+            if dp_shard_dims:
+                dp_shard_mesh_dim = dp_shard_dims[0]
+                dp_group = grad.device_mesh.get_group(mesh_dim=dp_shard_mesh_dim)
+                dp_size = torch.distributed.get_world_size(dp_group)
+                dp_rank = torch.distributed.get_rank(dp_group)
+
+                # All-gather local shards across DP group to reconstruct full TP-local gradient.
+                local_tensor = grad._local_tensor  # shape: [M/dp, ...]
+                local_shape = local_tensor.shape
+                local_flat = local_tensor.contiguous().view(-1)
+                full_flat = torch.empty(
+                    dp_size * local_flat.numel(),
+                    dtype=local_flat.dtype,
+                    device=local_flat.device,
+                )
+                torch.distributed.all_gather_into_tensor(full_flat, local_flat, group=dp_group)
+                full_tensor = full_flat.view(dp_size * local_shape[0], *local_shape[1:])
+
+                # Apply orthogonalization on the full TP-local gradient.
+                if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+                    grad_shape = full_tensor.shape
+                    num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
+                    qkv_grads = torch.split(
+                        full_tensor.view(num_query_groups, sum(self.qkv_split_shapes), -1),
+                        self.qkv_split_shapes,
+                        dim=1,
+                    )
+                    qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
+                    qkv_grads = [
+                        self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                            num_query_groups, -1, grad_shape[-1]
+                        )
+                        for g in qkv_grads
+                    ]
+                    orth_full = torch.cat(qkv_grads, dim=1).view(grad_shape)
+                else:
+                    orth_full = self.scaled_orthogonalize_fn(full_tensor, tp_group, partition_dim)
+
+                # Extract this rank's local DP shard and wrap as DTensor.
+                local_orth = orth_full[
+                    dp_rank * local_shape[0] : (dp_rank + 1) * local_shape[0]
+                ].contiguous()
+                return DTensor.from_local(
+                    local_orth,
+                    device_mesh=grad.device_mesh,
+                    placements=grad.placements,
+                    run_check=False,
+                    shape=grad.shape,
+                    stride=grad.stride(),
+                )
+
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             # split grouped attention parameters (e.g., QKV, GQA, etc.)
             grad_shape = grad.shape
