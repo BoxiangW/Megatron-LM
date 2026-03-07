@@ -1514,7 +1514,7 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        if 'muon' not in config.optimizer:
+        if config.optimizer != "dist_muon":
             # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
             # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
             # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,

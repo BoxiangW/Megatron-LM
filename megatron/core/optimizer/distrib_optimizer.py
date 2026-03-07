@@ -55,7 +55,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
-from .muon import Muon, MuonDistMeta
+from .muon_adam import Muon, MuonDistMeta
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 
 logger = getLogger(__name__)
@@ -365,8 +365,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # gen dist meta
                 param_world_indexes = param_gbuf_ranges["world_indexes"]
-                tp_split_dim = -1 if getattr(model_param, 'tensor_model_parallel', False) else \
-                    getattr(model_param, 'partition_dim')
+                tp_split_dim = getattr(model_param, 'partition_dim') if getattr(model_param, 'tensor_model_parallel', False) else \
+                    -1
                 dist_meta = MuonDistMeta(gbuf_index, bucket_index, model_param.shape, param_world_indexes, tp_split_dim)
 
                 # fp16, bf16 params.
@@ -429,6 +429,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                     # add to dist metas
+                    # TODO(@boxiangw): currently it assumes last group is Muon
                     dist_metas[shard_main_param] = dist_meta
 
                 # fp32 params.
@@ -526,16 +527,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-<<<<<<< HEAD
         assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer, Muon))
             or optimizer is None
         ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
-=======
-        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer, Muon)) or optimizer is None, (
-            "Only Adam / HybridDeviceOptimizer / Muon currently supported, "
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
+            "Only Adam, HybridDeviceOptimizer and Muon currently supported, "
             "due to checkpointing requirements."
         )
 
@@ -627,8 +623,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-<<<<<<< HEAD
-=======
             # for muon optimizer, enable distributed mode
             if isinstance(self.optimizer, Muon):
                 assert all(grad_buffer.grad_dtype == torch.float32 for grad_buffer in self.buffers), \
@@ -641,9 +635,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     dist_metas,
                 )
 
-        self.is_stub_optimizer = False
 
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -828,13 +820,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 (numel,), dtype=dtype, device=torch.cuda.current_device()
                             )
 
-<<<<<<< HEAD
                             # For precision_aware_optimizer, the empty tensors should also be
                             #  initialized with the correct dtype.
                             tensors = {
                                 "exp_avg": init_shard(self.config.exp_avg_dtype),
                                 "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
                             }
+                            if isinstance(self.optimizer, Muon):
+                                tensors["muon_buffer"] = tensors["exp_avg"]
+                                tensors["adamw_exp_avg"] = tensors["exp_avg"]
+                                tensors["adamw_exp_avg_sq"] = tensors["exp_avg_sq"]
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                                 if self.config.store_param_remainders and self.config.bf16:
                                     tensors["master_param"] = init_shard(torch.int16)
@@ -842,16 +837,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     tensors["master_param"] = init_shard(
                                         self.config.main_params_dtype
                                     )
-=======
-                            tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
-                            # for muon optimizer link state ( for load state dict )
-                            if isinstance(self.optimizer, Muon):
-                                tensors["muon_buffer"] = tensors["exp_avg"]
-                                tensors["adamw_exp_avg"] = tensors["exp_avg"]
-                                tensors["adamw_exp_avg_sq"] = tensors["exp_avg_sq"]
-                            if self.config.use_precision_aware_optimizer:
-                                tensors["master_param"] = init_shard()
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
                             state_dict_state.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).
@@ -955,13 +940,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-<<<<<<< HEAD
             tensors = {"param": main_param}
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
-=======
-            tensors = {"param": main_param, **optim_state}
 
         # process muon to be compatiable with adam ( always save to exp_avg / exp_avg_sq )
         if isinstance(self.optimizer, Muon):
@@ -972,7 +954,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 tensors["exp_avg"] = tensors["adamw_exp_avg"]
                 tensors["exp_avg_sq"] = tensors["adamw_exp_avg_sq"]
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
         return tensors
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
@@ -1009,11 +990,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
             for key in dst_tensors:
-<<<<<<< HEAD
-                if not isinstance(tensors[key], torch.Tensor):
-=======
-                if not key in tensors:
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
+                if not key in tensors or not isinstance(tensors[key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[key])
 

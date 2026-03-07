@@ -256,7 +256,6 @@ class OptimizerConfig:
     """Momentum factor for SGD optimizer."""
 
     # Muon.
-<<<<<<< HEAD
     # TODO: move muon configs to it's own `MuonConfig`.
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
@@ -281,14 +280,6 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
-=======
-    muon_momentum: float = 0.95
-    """Momentum factor for Muon optimizer."""
-    muon_nesterov: bool = True
-    muon_ns_steps: int = 5
-    """The adamw update rms that muon is designed to matched, typicially 0.2 ~ 0.4"""
-    muon_matched_adamw_rms: float = 0.2
->>>>>>> f432fbe45 (a proof of concept for Distributed Muon)
 
     #######################
     # Distributed optimizer
