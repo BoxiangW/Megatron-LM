@@ -5,6 +5,11 @@ from typing import Tuple, Dict
 import torch
 import math
 import torch.distributed as dist
+try:
+    from torch.distributed.tensor import Shard as DTensorShard
+    _HAVE_DTENSOR = True
+except ImportError:
+    _HAVE_DTENSOR = False
 
 
 # copy from https://github.com/KellerJordan/Muon/tree/master
@@ -235,12 +240,11 @@ class Muon(torch.optim.Optimizer):
             tp_world_size = dist.get_world_size(self.tp_group)
             tp_rank = dist.get_rank(self.tp_group)
 
-        # FSDP mode: all-gather local DP shards to reconstruct TP-local tensors for NS.
-        # For each FSDP DTensor param (ZeRO-2/3), the local shard has shape
-        # (global_rows / dp_size [/ tp_size if TP on dim 0], global_cols [/ tp_size if TP on dim 1]).
-        # All-gather across the FSDP (inner DP) group concatenates along dim 0 to recover the
-        # TP-local shape, which is the correct input for Newton-Schulz orthogonalization.
-        fsdp_metas = {}  # p -> (dist_index, tp_split_dim, dp_world_size, dp_rank)
+        # FSDP mode: reconstruct TP-local tensors for NS.
+        # For DP-sharded params (ZeRO-2/3): all-gather local DP shards across the FSDP (inner DP)
+        # group to get the full TP-local tensor (concatenates along dim 0).
+        # For replicated params (no_shard/ZeRO-1): local tensor is already the TP-local tensor.
+        fsdp_metas = {}  # p -> (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
         for p in list(ns_inputs.keys()):
             if not hasattr(p, 'megatron_fsdp_dist_index'):
                 continue
@@ -250,6 +254,16 @@ class Muon(torch.optim.Optimizer):
             dp_world_size = dist.get_world_size(fsdp_group)
             dp_rank = dist.get_rank(fsdp_group)
 
+            # Check if the DP dimension is actually sharded (ZeRO-2/3) or replicated (no_shard)
+            is_dp_sharded = False
+            dp_shard_dim_name = dist_index.dp_shard_dim
+            if (_HAVE_DTENSOR and dp_shard_dim_name is not None
+                    and p.device_mesh.mesh_dim_names is not None):
+                mesh_dims = list(p.device_mesh.mesh_dim_names)
+                if dp_shard_dim_name in mesh_dims:
+                    dp_mesh_idx = mesh_dims.index(dp_shard_dim_name)
+                    is_dp_sharded = isinstance(p.placements[dp_mesh_idx], DTensorShard)
+
             # Determine TP split dimension from original param attributes
             orig_param = p.orig_param
             tp_split_dim = -1
@@ -257,18 +271,20 @@ class Muon(torch.optim.Optimizer):
                     and not getattr(orig_param, '_tp_duplicated', False)):
                 tp_split_dim = getattr(orig_param, 'partition_dim', -1)
 
-            fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank)
+            fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
 
-            # All-gather local DP shard across FSDP group to get TP-local tensor
-            local_shard = ns_inputs[p]  # bfloat16, shape: (rows/dp, cols[/tp])
-            tp_local_rows = local_shard.shape[0] * dp_world_size
-            full_tp_local = torch.empty(
-                (tp_local_rows, *local_shard.shape[1:]),
-                dtype=local_shard.dtype,
-                device=local_shard.device,
-            )
-            dist.all_gather_into_tensor(full_tp_local, local_shard.contiguous(), group=fsdp_group)
-            ns_inputs[p] = full_tp_local  # TP-local 2D tensor
+            if is_dp_sharded:
+                # All-gather local DP shard across FSDP group to get TP-local tensor
+                local_shard = ns_inputs[p]  # bfloat16, shape: (rows/dp, cols[/tp])
+                tp_local_rows = local_shard.shape[0] * dp_world_size
+                full_tp_local = torch.empty(
+                    (tp_local_rows, *local_shard.shape[1:]),
+                    dtype=local_shard.dtype,
+                    device=local_shard.device,
+                )
+                dist.all_gather_into_tensor(full_tp_local, local_shard.contiguous(), group=fsdp_group)
+                ns_inputs[p] = full_tp_local  # TP-local 2D tensor
+            # else: ns_inputs[p] is already the TP-local tensor (replicated across DP)
 
         # apply NS updates
         for group in self.param_groups:
@@ -292,7 +308,7 @@ class Muon(torch.optim.Optimizer):
                     dist_meta = self.dist_metas[p]
                     tp_split_dim = dist_meta.tp_split_dim
                 elif is_fsdp:
-                    dist_index, tp_split_dim, dp_world_size, dp_rank = fsdp_metas[p]
+                    dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded = fsdp_metas[p]
 
                 # gather tensor parallel ( if tp )
                 if tp_split_dim != -1:
@@ -330,8 +346,9 @@ class Muon(torch.optim.Optimizer):
                     adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
                     p.data.add_(update, alpha=-adjusted_lr)
                 elif is_fsdp:
-                    # Take DP-local shard (along dim 0 of the TP-local update)
-                    update_local = update.chunk(dp_world_size, dim=0)[dp_rank]
+                    # Take DP-local shard (along dim 0) when DP-sharded (ZeRO-2/3),
+                    # or use the full update for replicated params (no_shard/ZeRO-1)
+                    update_local = update.chunk(dp_world_size, dim=0)[dp_rank] if is_dp_sharded else update
                     local_tensor = p._local_tensor
                     adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
                     local_tensor.mul_(1 - lr * weight_decay)
