@@ -174,21 +174,28 @@ class Muon(torch.optim.Optimizer):
 
                 g = p.grad
                 assert g is not None
-                # 1-dim grad for distributed mode
-                assert self.distributed_mode or g.dim() == 2
+
+                # For FSDP DTensor params, work with local shard for momentum accumulation
+                is_fsdp = hasattr(p, 'megatron_fsdp_dist_index')
+                if is_fsdp:
+                    g_local = g._local_tensor
+                else:
+                    # 1-dim grad for distributed mode
+                    assert self.distributed_mode or g.dim() == 2
+                    g_local = g
 
                 # prepare muon buffer in state
                 state = self.state[p]
-                if not "muon_buffer" in state:
-                    state["muon_buffer"] = torch.zeros_like(g)
+                if "muon_buffer" not in state:
+                    state["muon_buffer"] = torch.zeros_like(g_local)
                 buf = state["muon_buffer"]
-                buf.mul_(momentum).add_(g)
+                buf.mul_(momentum).add_(g_local)
 
-                # save to ns input
-                g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
-                ns_inputs[p] = g.bfloat16()
-        
-        # rewrite ns_inputs if distributed
+                # save to ns input (local shard, bfloat16)
+                g_ns = g_local.add(buf, alpha=momentum) if group['nesterov'] else buf
+                ns_inputs[p] = g_ns.bfloat16()
+
+        # rewrite ns_inputs if ZeRO-1 distributed mode
         if self.distributed_mode:
 
             # initialize buffers
@@ -228,7 +235,42 @@ class Muon(torch.optim.Optimizer):
             tp_world_size = dist.get_world_size(self.tp_group)
             tp_rank = dist.get_rank(self.tp_group)
 
-        # update muon momentum first
+        # FSDP mode: all-gather local DP shards to reconstruct TP-local tensors for NS.
+        # For each FSDP DTensor param (ZeRO-2/3), the local shard has shape
+        # (global_rows / dp_size [/ tp_size if TP on dim 0], global_cols [/ tp_size if TP on dim 1]).
+        # All-gather across the FSDP (inner DP) group concatenates along dim 0 to recover the
+        # TP-local shape, which is the correct input for Newton-Schulz orthogonalization.
+        fsdp_metas = {}  # p -> (dist_index, tp_split_dim, dp_world_size, dp_rank)
+        for p in list(ns_inputs.keys()):
+            if not hasattr(p, 'megatron_fsdp_dist_index'):
+                continue
+
+            dist_index = p.megatron_fsdp_dist_index
+            fsdp_group = dist_index.fsdp_group
+            dp_world_size = dist.get_world_size(fsdp_group)
+            dp_rank = dist.get_rank(fsdp_group)
+
+            # Determine TP split dimension from original param attributes
+            orig_param = p.orig_param
+            tp_split_dim = -1
+            if (getattr(orig_param, 'tensor_model_parallel', False)
+                    and not getattr(orig_param, '_tp_duplicated', False)):
+                tp_split_dim = getattr(orig_param, 'partition_dim', -1)
+
+            fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank)
+
+            # All-gather local DP shard across FSDP group to get TP-local tensor
+            local_shard = ns_inputs[p]  # bfloat16, shape: (rows/dp, cols[/tp])
+            tp_local_rows = local_shard.shape[0] * dp_world_size
+            full_tp_local = torch.empty(
+                (tp_local_rows, *local_shard.shape[1:]),
+                dtype=local_shard.dtype,
+                device=local_shard.device,
+            )
+            dist.all_gather_into_tensor(full_tp_local, local_shard.contiguous(), group=fsdp_group)
+            ns_inputs[p] = full_tp_local  # TP-local 2D tensor
+
+        # apply NS updates
         for group in self.param_groups:
 
             if not group.get('use_muon', False):
@@ -244,35 +286,62 @@ class Muon(torch.optim.Optimizer):
 
                 ns_input = ns_inputs[p]
                 tp_split_dim = -1
+                is_fsdp = p in fsdp_metas
 
                 if self.distributed_mode:
                     dist_meta = self.dist_metas[p]
                     tp_split_dim = dist_meta.tp_split_dim
+                elif is_fsdp:
+                    dist_index, tp_split_dim, dp_world_size, dp_rank = fsdp_metas[p]
 
                 # gather tensor parallel ( if tp )
                 if tp_split_dim != -1:
-                    ns_input_shards = [ torch.empty_like(ns_input) for _ in range(tp_world_size) ]
-                    dist.all_gather(ns_input_shards, ns_input, self.tp_group)
-                    ns_input = torch.cat(ns_input_shards, dim=tp_split_dim)
+                    if self.distributed_mode:
+                        ns_input_shards = [ torch.empty_like(ns_input) for _ in range(tp_world_size) ]
+                        dist.all_gather(ns_input_shards, ns_input, self.tp_group)
+                        ns_input = torch.cat(ns_input_shards, dim=tp_split_dim)
+                    elif is_fsdp and dist_index.tp_dim is not None:
+                        fsdp_tp_mesh = dist_index.get_submesh(dist_index.tp_dim)
+                        fsdp_tp_grp = fsdp_tp_mesh.get_group()
+                        fsdp_tp_ws = dist.get_world_size(fsdp_tp_grp)
+                        fsdp_tp_rk = dist.get_rank(fsdp_tp_grp)
+                        ns_input_shards = [ torch.empty_like(ns_input) for _ in range(fsdp_tp_ws) ]
+                        dist.all_gather(ns_input_shards, ns_input, fsdp_tp_grp)
+                        ns_input = torch.cat(ns_input_shards, dim=tp_split_dim)
+                    else:
+                        tp_split_dim = -1  # no TP group available, skip TP gather
 
                 # calc update
                 update = zeropower_via_newtonschulz5(ns_input, steps=ns_steps)
 
                 # only local tp part
                 if tp_split_dim != -1:
-                    update = update.chunk(tp_world_size, dim=tp_split_dim)[tp_rank]
+                    if self.distributed_mode:
+                        update = update.chunk(tp_world_size, dim=tp_split_dim)[tp_rank]
+                    else:  # FSDP
+                        update = update.chunk(fsdp_tp_ws, dim=tp_split_dim)[fsdp_tp_rk]
 
-                # only local buffer part
+                # apply weight decay and update
                 if self.distributed_mode:
+                    # only local buffer part
                     local_range_in_global_range = normalize_range(dist_meta.local_range, dist_meta.global_range[0])
                     update = update.reshape(-1)[local_range_in_global_range[0]:local_range_in_global_range[1]]
-
-                # apply weight decay
-                p.data.mul_(1 - lr*weight_decay)
-
-                #  adjust lr and apply update
-                adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
-                p.data.add_(update, alpha=-adjusted_lr)
+                    p.data.mul_(1 - lr*weight_decay)
+                    adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
+                    p.data.add_(update, alpha=-adjusted_lr)
+                elif is_fsdp:
+                    # Take DP-local shard (along dim 0 of the TP-local update)
+                    update_local = update.chunk(dp_world_size, dim=0)[dp_rank]
+                    local_tensor = p._local_tensor
+                    adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
+                    local_tensor.mul_(1 - lr * weight_decay)
+                    local_tensor.add_(update_local.to(local_tensor.dtype), alpha=-adjusted_lr)
+                else:
+                    # apply weight decay
+                    p.data.mul_(1 - lr*weight_decay)
+                    #  adjust lr and apply update
+                    adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
+                    p.data.add_(update, alpha=-adjusted_lr)
 
         # use adam for other params
         for group in self.param_groups:

@@ -1420,15 +1420,17 @@ def validate_args(args, defaults={}):
 
     # Muon optimizer check
     if args.optimizer == "dist_muon":
+        assert not args.use_distributed_optimizer, "dist_muon does not support --use-distributed-optimizer. Use --optimizer muon instead."
+        assert not args.use_torch_fsdp2, "dist_muon does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "dist_muon does not support Megatron-FSDP. Use --optimizer muon --use-distributed-optimizer instead."
 
-        if args.optimizer == 'muon':
-            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
-            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
-
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
-        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
-        # assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
-        # assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+    if args.optimizer == 'muon':
+        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce."
+        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather."
+        assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2."
+        if args.use_megatron_fsdp:
+            assert args.use_distributed_optimizer, \
+                "--optimizer muon with --use-megatron-fsdp requires --use-distributed-optimizer."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
