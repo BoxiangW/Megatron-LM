@@ -240,10 +240,9 @@ class Muon(torch.optim.Optimizer):
             tp_world_size = dist.get_world_size(self.tp_group)
             tp_rank = dist.get_rank(self.tp_group)
 
-        # FSDP mode: reconstruct TP-local tensors for NS.
-        # For DP-sharded params (ZeRO-2/3): all-gather local DP shards across the FSDP (inner DP)
-        # group to get the full TP-local tensor (concatenates along dim 0).
-        # For replicated params (no_shard/ZeRO-1): local tensor is already the TP-local tensor.
+        # FSDP mode: precompute metadata for each FSDP param (no large allocations here).
+        # The actual all-gather is deferred to the per-parameter NS loop below so that
+        # only one full-size tensor is live at a time, preserving ZeRO-3 memory savings.
         fsdp_metas = {}  # p -> (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
         for p in list(ns_inputs.keys()):
             if not hasattr(p, 'megatron_fsdp_dist_index'):
@@ -273,19 +272,6 @@ class Muon(torch.optim.Optimizer):
 
             fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
 
-            if is_dp_sharded:
-                # All-gather local DP shard across FSDP group to get TP-local tensor
-                local_shard = ns_inputs[p]  # bfloat16, shape: (rows/dp, cols[/tp])
-                tp_local_rows = local_shard.shape[0] * dp_world_size
-                full_tp_local = torch.empty(
-                    (tp_local_rows, *local_shard.shape[1:]),
-                    dtype=local_shard.dtype,
-                    device=local_shard.device,
-                )
-                dist.all_gather_into_tensor(full_tp_local, local_shard.contiguous(), group=fsdp_group)
-                ns_inputs[p] = full_tp_local  # TP-local 2D tensor
-            # else: ns_inputs[p] is already the TP-local tensor (replicated across DP)
-
         # apply NS updates
         for group in self.param_groups:
 
@@ -309,6 +295,22 @@ class Muon(torch.optim.Optimizer):
                     tp_split_dim = dist_meta.tp_split_dim
                 elif is_fsdp:
                     dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded = fsdp_metas[p]
+
+                    # FSDP DP all-gather: done per-parameter to avoid holding all full
+                    # tensors simultaneously (preserves ZeRO-3 memory savings).
+                    if is_dp_sharded:
+                        fsdp_group = dist_index.fsdp_group
+                        local_shard = ns_input  # bfloat16, shape: (rows/dp, cols[/tp])
+                        tp_local_rows = local_shard.shape[0] * dp_world_size
+                        full_tp_local = torch.empty(
+                            (tp_local_rows, *local_shard.shape[1:]),
+                            dtype=local_shard.dtype,
+                            device=local_shard.device,
+                        )
+                        dist.all_gather_into_tensor(
+                            full_tp_local, local_shard.contiguous(), group=fsdp_group,
+                        )
+                        ns_input = full_tp_local
 
                 # gather tensor parallel ( if tp )
                 if tp_split_dim != -1:
