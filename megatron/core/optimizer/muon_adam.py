@@ -114,7 +114,16 @@ class Muon(torch.optim.Optimizer):
 
         super().__init__(param_groups, defaults)
         self.distributed_mode = False
+        self.fsdp_distributed_mode = False
 
+    def enable_fsdp_distributed_mode(self, global_buffer_sizes, dist_group, tp_group,
+                                     dist_metas: Dict[torch.nn.Parameter, MuonDistMeta]):
+        """
+        Enable FSDP distributed mode. Uses the same buffer-level all-gather approach
+        as DDP ZeRO-1 distributed mode, but adapted for FSDP DTensor params.
+        """
+        self.enable_distributed_mode(global_buffer_sizes, dist_group, tp_group, dist_metas)
+        self.fsdp_distributed_mode = True
 
     def enable_distributed_mode(self, global_buffer_sizes, dist_group, tp_group,
                                 dist_metas: Dict[torch.nn.Parameter, MuonDistMeta]):
@@ -178,13 +187,23 @@ class Muon(torch.optim.Optimizer):
             for p in params:
 
                 g = p.grad
-                assert g is not None
 
                 # For FSDP DTensor params, work with local shard for momentum accumulation
                 is_fsdp = hasattr(p, 'megatron_fsdp_dist_index')
                 if is_fsdp:
+                    # In FSDP distributed mode with buffer-level sharding, some params
+                    # may not intersect this rank's shard, so grad is None.
+                    if g is None:
+                        # Initialize zero-size momentum buffer so distributed mode
+                        # buffer packing works correctly (copies zero elements).
+                        state = self.state[p]
+                        if "muon_buffer" not in state:
+                            state["muon_buffer"] = p._local_tensor.new_empty(0)
+                        ns_inputs[p] = p._local_tensor.new_empty(0).bfloat16()
+                        continue
                     g_local = g._local_tensor
                 else:
+                    assert g is not None
                     # 1-dim grad for distributed mode
                     assert self.distributed_mode or g.dim() == 2
                     g_local = g
@@ -237,40 +256,44 @@ class Muon(torch.optim.Optimizer):
                 ns_inputs[p] = ns_input_global_buffer[global_range[0] - offset : global_range[1] - offset].view(dist_meta.shape)
 
             # set tp info
-            tp_world_size = dist.get_world_size(self.tp_group)
-            tp_rank = dist.get_rank(self.tp_group)
+            if self.tp_group is not None:
+                tp_world_size = dist.get_world_size(self.tp_group)
+                tp_rank = dist.get_rank(self.tp_group)
+            else:
+                tp_world_size = 1
+                tp_rank = 0
 
-        # FSDP mode: precompute metadata for each FSDP param (no large allocations here).
-        # The actual all-gather is deferred to the per-parameter NS loop below so that
-        # only one full-size tensor is live at a time, preserving ZeRO-3 memory savings.
-        fsdp_metas = {}  # p -> (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
-        for p in list(ns_inputs.keys()):
-            if not hasattr(p, 'megatron_fsdp_dist_index'):
-                continue
+        # FSDP non-distributed mode: precompute metadata for each FSDP param.
+        # Used only for FSDP no_shard mode (replicated params, per-param all-gather).
+        # For FSDP sharded modes (optim/optim_grads/optim_grads_params),
+        # fsdp_distributed_mode=True and the buffer-level all-gather above is used instead.
+        fsdp_metas = {}
+        if not self.fsdp_distributed_mode:
+            for p in list(ns_inputs.keys()):
+                if not hasattr(p, 'megatron_fsdp_dist_index'):
+                    continue
 
-            dist_index = p.megatron_fsdp_dist_index
-            fsdp_group = dist_index.fsdp_group
-            dp_world_size = dist.get_world_size(fsdp_group)
-            dp_rank = dist.get_rank(fsdp_group)
+                dist_index = p.megatron_fsdp_dist_index
+                fsdp_group = dist_index.fsdp_group
+                dp_world_size = dist.get_world_size(fsdp_group)
+                dp_rank = dist.get_rank(fsdp_group)
 
-            # Check if the DP dimension is actually sharded (ZeRO-2/3) or replicated (no_shard)
-            is_dp_sharded = False
-            dp_shard_dim_name = dist_index.dp_shard_dim
-            if (_HAVE_DTENSOR and dp_shard_dim_name is not None
-                    and p.device_mesh.mesh_dim_names is not None):
-                mesh_dims = list(p.device_mesh.mesh_dim_names)
-                if dp_shard_dim_name in mesh_dims:
-                    dp_mesh_idx = mesh_dims.index(dp_shard_dim_name)
-                    is_dp_sharded = isinstance(p.placements[dp_mesh_idx], DTensorShard)
+                is_dp_sharded = False
+                dp_shard_dim_name = dist_index.dp_shard_dim
+                if (_HAVE_DTENSOR and dp_shard_dim_name is not None
+                        and p.device_mesh.mesh_dim_names is not None):
+                    mesh_dims = list(p.device_mesh.mesh_dim_names)
+                    if dp_shard_dim_name in mesh_dims:
+                        dp_mesh_idx = mesh_dims.index(dp_shard_dim_name)
+                        is_dp_sharded = isinstance(p.placements[dp_mesh_idx], DTensorShard)
 
-            # Determine TP split dimension from original param attributes
-            orig_param = p.orig_param
-            tp_split_dim = -1
-            if (getattr(orig_param, 'tensor_model_parallel', False)
-                    and not getattr(orig_param, '_tp_duplicated', False)):
-                tp_split_dim = getattr(orig_param, 'partition_dim', -1)
+                orig_param = p.orig_param
+                tp_split_dim = -1
+                if (getattr(orig_param, 'tensor_model_parallel', False)
+                        and not getattr(orig_param, '_tp_duplicated', False)):
+                    tp_split_dim = getattr(orig_param, 'partition_dim', -1)
 
-            fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
+                fsdp_metas[p] = (dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded)
 
         # apply NS updates
         for group in self.param_groups:
@@ -296,11 +319,10 @@ class Muon(torch.optim.Optimizer):
                 elif is_fsdp:
                     dist_index, tp_split_dim, dp_world_size, dp_rank, is_dp_sharded = fsdp_metas[p]
 
-                    # FSDP DP all-gather: done per-parameter to avoid holding all full
-                    # tensors simultaneously (preserves ZeRO-3 memory savings).
+                    # Per-param DP all-gather for FSDP no_shard mode only.
                     if is_dp_sharded:
                         fsdp_group = dist_index.fsdp_group
-                        local_shard = ns_input  # bfloat16, shape: (rows/dp, cols[/tp])
+                        local_shard = ns_input
                         tp_local_rows = local_shard.shape[0] * dp_world_size
                         full_tp_local = torch.empty(
                             (tp_local_rows, *local_shard.shape[1:]),
@@ -340,16 +362,24 @@ class Muon(torch.optim.Optimizer):
                         update = update.chunk(fsdp_tp_ws, dim=tp_split_dim)[fsdp_tp_rk]
 
                 # apply weight decay and update
-                if self.distributed_mode:
-                    # only local buffer part
+                if self.fsdp_distributed_mode:
+                    # FSDP distributed mode: buffer-level all-gather was done above,
+                    # but weight update must go through DTensor's _local_tensor.
+                    local_range_in_global_range = normalize_range(dist_meta.local_range, dist_meta.global_range[0])
+                    update_local = update.reshape(-1)[local_range_in_global_range[0]:local_range_in_global_range[1]]
+                    local_tensor = p._local_tensor
+                    adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
+                    local_tensor.mul_(1 - lr * weight_decay)
+                    local_tensor.add_(update_local.to(local_tensor.dtype), alpha=-adjusted_lr)
+                elif self.distributed_mode:
+                    # DDP distributed mode: weight update on flat shard.
                     local_range_in_global_range = normalize_range(dist_meta.local_range, dist_meta.global_range[0])
                     update = update.reshape(-1)[local_range_in_global_range[0]:local_range_in_global_range[1]]
                     p.data.mul_(1 - lr*weight_decay)
                     adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
                     p.data.add_(update, alpha=-adjusted_lr)
                 elif is_fsdp:
-                    # Take DP-local shard (along dim 0) when DP-sharded (ZeRO-2/3),
-                    # or use the full update for replicated params (no_shard/ZeRO-1)
+                    # FSDP non-distributed: per-param all-gather was done above.
                     update_local = update.chunk(dp_world_size, dim=0)[dp_rank] if is_dp_sharded else update
                     local_tensor = p._local_tensor
                     adjusted_lr = adjust_lr_wd_for_muon(lr, matched_adamw_rms, ns_input.shape)
@@ -384,7 +414,9 @@ class Muon(torch.optim.Optimizer):
             for p in params:
 
                 g = p.grad
-                assert g is not None
+                if g is None:
+                    # FSDP: param shard doesn't exist on this rank.
+                    continue
                 state = self.state[p]
 
                 if len(state) == 0:

@@ -543,6 +543,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
+            if isinstance(optimizer, Muon):
+                self._enable_fsdp_muon_distributed_mode()
             return
 
         # Model grad buffer ranges.
@@ -635,6 +637,87 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     dist_metas,
                 )
 
+
+    def _enable_fsdp_muon_distributed_mode(self):
+        """
+        Set up buffer-level distributed mode for Muon optimizer with FSDP.
+
+        FSDP uses buffer-level sharding where each rank stores a uniform shard of
+        the entire parameter buffer. Individual parameters may not intersect a given
+        rank's shard, so per-parameter all-gather (with all_gather_into_tensor) would
+        fail due to uneven sizes. Instead, we reuse Muon's existing buffer-level
+        all-gather infrastructure (same as DDP ZeRO-1's distributed_mode).
+        """
+        from megatron.core.optimizer.muon_adam import MuonDistMeta
+
+        # For FSDP, model_chunks is a list of MegatronFSDP instances.
+        # Each model chunk has one param_and_grad_buffer.
+        global_buffer_sizes = []
+        dist_metas = {}
+
+        # Collect the DP group and TP group from the first model chunk.
+        first_chunk = self.model_chunks[0]
+        pgb = first_chunk.param_and_grad_buffer
+        dist_index = pgb.dist_index
+        fsdp_group = dist_index.fsdp_group
+
+        # Try to get the TP group from the dist_index.
+        if dist_index.tp_dim is not None:
+            tp_mesh = dist_index.get_submesh(dist_index.tp_dim)
+            tp_group = tp_mesh.get_group()
+        else:
+            # No TP: create a trivial group or use a single-rank group.
+            tp_group = None
+
+        # Build buffer metadata from each model chunk's param_and_grad_buffer.
+        for chunk_idx, model_chunk in enumerate(self.model_chunks):
+            pgb = model_chunk.param_and_grad_buffer
+            chunk_bucket_data = []
+
+            # Build name -> optimizer param lookup.
+            opt_param_by_name = dict(pgb.optimizer_named_parameters)
+
+            for pg in pgb.parameter_groups:
+                # Use main_weight_buffer for the buffer layout (same layout as grad buffer).
+                buf = pg.main_weight_buffer
+                if buf is None:
+                    buf = pg.main_grad_buffer
+                if buf is None:
+                    continue
+
+                bucket_size = buf.bucket_index.size
+                chunk_bucket_data.append((bucket_size, 0))
+
+                for item_id, orig_param in enumerate(pg.params):
+                    item_index = buf.item_index_map[item_id]
+                    global_range = (
+                        item_index.global_data_index,
+                        item_index.global_data_index + item_index.size,
+                    )
+
+                    tp_split_dim = -1
+                    if (getattr(orig_param, 'tensor_model_parallel', False)
+                            and not getattr(orig_param, '_tp_duplicated', False)):
+                        tp_split_dim = getattr(orig_param, 'partition_dim', -1)
+
+                    meta = MuonDistMeta(
+                        buffer_idx=chunk_idx,
+                        bucket_idx=len(chunk_bucket_data) - 1,
+                        shape=orig_param.shape,
+                        global_range=global_range,
+                        tp_split_dim=tp_split_dim,
+                    )
+
+                    param_name = pgb.param_to_name[orig_param]
+                    opt_param = opt_param_by_name.get(param_name)
+                    if opt_param is not None:
+                        dist_metas[opt_param] = meta
+
+            global_buffer_sizes.append(chunk_bucket_data)
+
+        self.optimizer.enable_fsdp_distributed_mode(
+            global_buffer_sizes, fsdp_group, tp_group, dist_metas,
+        )
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """

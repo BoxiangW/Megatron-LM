@@ -1431,6 +1431,11 @@ def validate_args(args, defaults={}):
         if args.use_megatron_fsdp:
             assert args.use_distributed_optimizer, \
                 "--optimizer muon with --use-megatron-fsdp requires --use-distributed-optimizer."
+            assert args.data_parallel_sharding_strategy != 'no_shard', \
+                "--optimizer muon with --use-megatron-fsdp requires " \
+                "--data-parallel-sharding-strategy to be 'optim', 'optim_grads', or " \
+                "'optim_grads_params' (not 'no_shard'). With 'no_shard', optimizer state " \
+                "is not sharded and uses more memory than --use-distributed-optimizer alone."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
